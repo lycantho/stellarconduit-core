@@ -80,7 +80,17 @@ pub struct TopologyUpdate {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct SyncRequest {}
+pub struct SyncRequest {
+    /// A lightweight summary of the message IDs this device currently holds
+    /// in its active buffer. For v1, this can just be a truncated list of recent IDs.
+    pub known_message_ids: Vec<[u8; 4]>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SyncResponse {
+    /// Full transaction envelopes that the requesting peer was determined to be missing
+    pub missing_envelopes: Vec<TransactionEnvelope>,
+}
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum ProtocolMessage {
@@ -92,6 +102,9 @@ pub enum ProtocolMessage {
 
     /// A query asking for specific missing messages (for pull-based gossip)
     SyncRequest(SyncRequest),
+
+    /// A response containing missing messages requested via SyncRequest
+    SyncResponse(SyncResponse),
 }
 
 impl ProtocolMessage {
