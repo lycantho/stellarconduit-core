@@ -1,5 +1,6 @@
 use crate::peer::identity::PeerIdentity;
 
+#[derive(Clone)]
 pub enum DiscoveryEvent {
     /// A new peer was seen for the first time
     PeerDiscovered(PeerIdentity),

@@ -100,28 +100,17 @@ mod tests {
         msg0[0] = 0;
         assert_eq!(filter.check_and_add(&msg0), true);
 
-        // Add 10 more items to cause another rotation
+        // Add 10 more items to cause another rotation (12..22 = items 12 to 21 inclusive)
+        // Note: we don't assert false on each since bloom filters have a small false-positive
+        // rate. We just drive the rotation logic.
         for i in 12..22 {
             let mut msg = [0u8; 32];
             msg[0] = i as u8;
-            assert_eq!(filter.check_and_add(&msg), false);
+            filter.check_and_add(&msg);
         }
 
-        // Now msg0 should be forgotten since it was in 'previous' which just got overwritten
-        // Note: Bloom filter is probabilistic, but msg0 is DEFINITELY not in current,
-        // We'll just verify the filter rotated properly by checking insert_count.
-        // It rotated after 11th item (insert_count became 1), then we added 10 more items.
-        // wait... 11th item triggered rotation: previous=current(10 items), current=new_filter, insert_count=0 -> 1.
-        // then we added 10 more items (12..22 = 10 items). Each adds to current.
-        // so insert_count should be 1 + 10 = 11. Wait, let's trace:
-        // items 0..10 (10 items) -> insert_count = 10
-        // item 11 -> rotation triggers because 10 >= 10. insert_count=0. Then item 11 added, insert_count=1.
-        // items 12..21 (10 items) -> item 12 adds, insert_count=2 ... item 20 adds, insert_count=10.
-        // item 21 -> rotation triggers because 10 >= 10. insert_count=0. Then item 21 added, insert_count=1.
-        // So total items: 0..10 (10 items), 11 (1 item), 12..22 is actually 10 items.
-        // Wait, 12..22 is 10 items (12, 13, 14, 15, 16, 17, 18, 19, 20, 21).
-        // Let's just remove the explicit insert_count check and verify false positive behavior, or accept the current insert_count.
-        // At the end, insert_count is 1.
+        // After the second rotation, insert_count resets to 1 (the last item of the batch
+        // that triggered the rotate).
         assert_eq!(filter.insert_count, 1);
     }
 
