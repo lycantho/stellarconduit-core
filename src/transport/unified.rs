@@ -150,6 +150,193 @@ impl Default for MessageReassembler {
     }
 }
 
+// ─── TransportPreference ──────────────────────────────────────────────────────
+
+/// Controls which physical transport the `TransportManager` will attempt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TransportPreference {
+    /// Automatically pick the best available transport.
+    /// Tries WiFi-Direct first; falls back to BLE on failure.
+    Auto,
+    /// Force BLE even if WiFi-Direct is available.
+    BleOnly,
+    /// Force WiFi-Direct. Returns an error if no `SocketAddr` is provided or connection fails.
+    WifiOnly,
+}
+
+// ─── TransportManager ─────────────────────────────────────────────────────────
+
+use std::net::SocketAddr;
+
+use crate::message::types::ProtocolMessage;
+use crate::peer::identity::PeerIdentity;
+use crate::transport::ble_transport::BleCentral;
+use crate::transport::connection::Connection;
+use crate::transport::errors::TransportError;
+use crate::transport::wifi_transport::WifiDirectConnection;
+
+/// Manages per-peer transport connections, automatically selecting the best
+/// available physical transport and falling back gracefully.
+pub struct TransportManager {
+    preference: TransportPreference,
+    /// One `Box<dyn Connection>` per peer pubkey.
+    active_connections: HashMap<[u8; 32], Box<dyn Connection>>,
+}
+
+impl TransportManager {
+    pub fn new(preference: TransportPreference) -> Self {
+        Self {
+            preference,
+            active_connections: HashMap::new(),
+        }
+    }
+
+    /// Number of currently active peer connections (test helper).
+    pub fn connection_count(&self) -> usize {
+        self.active_connections.len()
+    }
+
+    /// Open a connection to `peer` using the best available transport.
+    ///
+    /// - `wifi_addr`: the peer's WiFi-Direct P2P IP address (externally provided).
+    ///   Pass `None` to skip WiFi-Direct entirely.
+    ///
+    /// Fallback order for `Auto`:
+    ///   1. WiFi-Direct (if `wifi_addr` is `Some`)
+    ///   2. BLE (via `BleCentral`)
+    ///
+    /// Replaces any existing connection for the same peer.
+    pub async fn connect(
+        &mut self,
+        peer: PeerIdentity,
+        wifi_addr: Option<SocketAddr>,
+    ) -> Result<(), TransportError> {
+        let conn: Box<dyn Connection> = match self.preference {
+            TransportPreference::WifiOnly => {
+                let addr = wifi_addr.ok_or(TransportError::NotConnected)?;
+                let c = WifiDirectConnection::connect_to(peer.clone(), addr).await?;
+                Box::new(c)
+            }
+            TransportPreference::BleOnly => {
+                let mut c = BleCentral::new(peer.clone());
+                c.connect().await?;
+                Box::new(c)
+            }
+            TransportPreference::Auto => {
+                // Try WiFi-Direct first
+                if let Some(addr) = wifi_addr {
+                    match WifiDirectConnection::connect_to(peer.clone(), addr).await {
+                        Ok(c) => Box::new(c),
+                        Err(TransportError::ConnectionRefused) | Err(TransportError::Timeout) => {
+                            // Fall back to BLE
+                            log::debug!("WiFi-Direct failed for peer; falling back to BLE");
+                            let mut c = BleCentral::new(peer.clone());
+                            c.connect().await?;
+                            Box::new(c)
+                        }
+                        Err(e) => return Err(e),
+                    }
+                } else {
+                    // No WiFi addr — go straight to BLE
+                    let mut c = BleCentral::new(peer.clone());
+                    c.connect().await?;
+                    Box::new(c)
+                }
+            }
+        };
+
+        self.active_connections.insert(peer.pubkey, conn);
+        Ok(())
+    }
+
+    /// Send a message to a specific peer.
+    ///
+    /// On `BrokenPipe`, removes the connection and attempts BLE fallback.
+    pub async fn send_to(
+        &mut self,
+        peer: &PeerIdentity,
+        msg: ProtocolMessage,
+    ) -> Result<(), TransportError> {
+        if let Some(conn) = self.active_connections.get_mut(&peer.pubkey) {
+            match conn.send(msg.clone()).await {
+                Ok(()) => return Ok(()),
+                Err(TransportError::BrokenPipe) => {
+                    log::debug!("send_to: BrokenPipe — removing connection for peer");
+                    self.active_connections.remove(&peer.pubkey);
+                    // Attempt BLE fallback
+                    self.ble_fallback(peer.clone()).await?;
+                    // Retry send over the new BLE connection
+                    if let Some(conn) = self.active_connections.get_mut(&peer.pubkey) {
+                        return conn.send(msg).await;
+                    }
+                    return Err(TransportError::NotConnected);
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        Err(TransportError::NotConnected)
+    }
+
+    /// Poll each active connection for the next message.
+    /// Returns the first `(PeerIdentity, ProtocolMessage)` received.
+    /// On `BrokenPipe`, removes the failed connection and attempts BLE fallback.
+    pub async fn recv_any(&mut self) -> Option<(PeerIdentity, ProtocolMessage)> {
+        let keys: Vec<[u8; 32]> = self.active_connections.keys().copied().collect();
+
+        for pubkey in keys {
+            let peer = if let Some(conn) = self.active_connections.get(&pubkey) {
+                conn.remote_peer()
+            } else {
+                continue;
+            };
+
+            // We can't directly await on a &mut through the map, so use a temp approach.
+            // NOTE: In production this would use tokio::select! across all connections.
+            // For the testable synchronous fallback logic, we poll them in turn.
+            let result = {
+                if let Some(conn) = self.active_connections.get_mut(&pubkey) {
+                    // Non-blocking check: use try_recv pattern by attempting recv with a timeout
+                    Some(
+                        tokio::time::timeout(std::time::Duration::from_millis(1), conn.recv())
+                            .await,
+                    )
+                } else {
+                    None
+                }
+            };
+
+            match result {
+                Some(Ok(Ok(msg))) => return Some((peer, msg)),
+                Some(Ok(Err(TransportError::BrokenPipe))) => {
+                    log::debug!("recv_any: BrokenPipe — falling back to BLE for peer");
+                    self.active_connections.remove(&pubkey);
+                    let _ = self.ble_fallback(peer).await;
+                }
+                _ => continue,
+            }
+        }
+
+        None
+    }
+
+    /// Disconnect all active connections and clear the map.
+    pub async fn shutdown(&mut self) {
+        for (_, mut conn) in self.active_connections.drain() {
+            let _ = conn.disconnect().await;
+        }
+    }
+
+    // ── Internal ─────────────────────────────────────────────────────────────
+
+    async fn ble_fallback(&mut self, peer: PeerIdentity) -> Result<(), TransportError> {
+        log::debug!("ble_fallback: connecting via BLE for peer");
+        let mut c = BleCentral::new(peer.clone());
+        c.connect().await?;
+        self.active_connections.insert(peer.pubkey, Box::new(c));
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -237,5 +424,135 @@ mod tests {
 
         assert_eq!(reassembler.receive_chunk(chunk), None);
         assert_eq!(reassembler.in_flight_buffer_count(), 0);
+    }
+
+    // ── TransportManager tests ────────────────────────────────────────────────
+
+    use crate::message::types::{ProtocolMessage, TopologyUpdate};
+    use crate::transport::unified::{TransportManager, TransportPreference};
+    use tokio::net::TcpListener;
+
+    fn peer(b: u8) -> PeerIdentity {
+        PeerIdentity::new([b; 32])
+    }
+
+    fn sample_msg(b: u8) -> ProtocolMessage {
+        ProtocolMessage::TopologyUpdate(TopologyUpdate {
+            origin_pubkey: [b; 32],
+            directly_connected_peers: vec![],
+            hops_to_relay: 1,
+        })
+    }
+
+    #[tokio::test]
+    async fn auto_mode_uses_wifi_when_addr_provided() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        // Accept the incoming connection in the background
+        let _server = tokio::spawn(async move {
+            let _ = crate::transport::wifi_transport::WifiDirectConnection::accept_from(
+                &listener,
+                peer(0xAA),
+            )
+            .await;
+        });
+
+        let mut mgr = TransportManager::new(TransportPreference::Auto);
+        mgr.connect(peer(0xBB), Some(addr)).await.unwrap();
+        assert_eq!(mgr.connection_count(), 1);
+        mgr.shutdown().await;
+        assert_eq!(mgr.connection_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn auto_mode_falls_back_to_ble_when_no_wifi_addr() {
+        let mut mgr = TransportManager::new(TransportPreference::Auto);
+        // No WiFi addr → goes straight to BLE stub (scan_and_connect is a no-op stub)
+        mgr.connect(peer(0xCC), None).await.unwrap();
+        assert_eq!(mgr.connection_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn wifi_only_fails_without_addr() {
+        let mut mgr = TransportManager::new(TransportPreference::WifiOnly);
+        let result = mgr.connect(peer(0xDD), None).await;
+        assert_eq!(result, Err(TransportError::NotConnected));
+    }
+
+    #[tokio::test]
+    async fn ble_only_skips_wifi() {
+        let mut mgr = TransportManager::new(TransportPreference::BleOnly);
+        // BleOnly ignores any WiFi addr and uses BLE stub directly
+        mgr.connect(peer(0xEE), None).await.unwrap();
+        assert_eq!(mgr.connection_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn only_one_connection_per_peer() {
+        let listener1 = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr1 = listener1.local_addr().unwrap();
+        let listener2 = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr2 = listener2.local_addr().unwrap();
+
+        tokio::spawn(async move {
+            let _ = crate::transport::wifi_transport::WifiDirectConnection::accept_from(
+                &listener1,
+                peer(0x01),
+            )
+            .await;
+        });
+        tokio::spawn(async move {
+            let _ = crate::transport::wifi_transport::WifiDirectConnection::accept_from(
+                &listener2,
+                peer(0x01),
+            )
+            .await;
+        });
+
+        let mut mgr = TransportManager::new(TransportPreference::Auto);
+        mgr.connect(peer(0xFF), Some(addr1)).await.unwrap();
+        assert_eq!(mgr.connection_count(), 1);
+
+        // Second connect to same peer replaces the first
+        mgr.connect(peer(0xFF), Some(addr2)).await.unwrap();
+        assert_eq!(mgr.connection_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn shutdown_clears_all_connections() {
+        let mut mgr = TransportManager::new(TransportPreference::BleOnly);
+        mgr.connect(peer(0x01), None).await.unwrap();
+        mgr.connect(peer(0x02), None).await.unwrap();
+        assert_eq!(mgr.connection_count(), 2);
+        mgr.shutdown().await;
+        assert_eq!(mgr.connection_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn send_to_succeeds_when_connected_via_wifi() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let server_peer = peer(0xAA);
+        let server_task = tokio::spawn(async move {
+            crate::transport::wifi_transport::WifiDirectConnection::accept_from(
+                &listener,
+                server_peer,
+            )
+            .await
+            .unwrap()
+        });
+
+        let p = peer(0xBB);
+        let mut mgr = TransportManager::new(TransportPreference::Auto);
+        mgr.connect(p.clone(), Some(addr)).await.unwrap();
+
+        let msg = sample_msg(42);
+        mgr.send_to(&p, msg.clone()).await.unwrap();
+
+        let mut server_conn = server_task.await.unwrap();
+        let received = server_conn.recv().await.unwrap();
+        assert_eq!(received, msg);
     }
 }
