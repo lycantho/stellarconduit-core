@@ -6,15 +6,14 @@ use tokio::time::sleep;
 use crate::gossip::round::{GossipScheduler, ACTIVE_ROUND_INTERVAL_MS, IDLE_ROUND_INTERVAL_MS};
 use crate::message::types::{SyncRequest, SyncResponse, TransactionEnvelope};
 
+#[derive(Default)]
 pub struct GossipState {
     pub active_envelopes: Vec<TransactionEnvelope>,
 }
 
 impl GossipState {
     pub fn new() -> Self {
-        Self {
-            active_envelopes: Vec::new(),
-        }
+        Default::default()
     }
 
     /// Add an envelope to the active buffer
