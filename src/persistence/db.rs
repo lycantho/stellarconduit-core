@@ -11,11 +11,13 @@ use tokio::sync::Mutex;
 /// A minimal in-memory stub for the persistent mesh database.
 ///
 /// Replace this with the real SQLite implementation from Issue #26.
+pub type PendingMessageRecord = ([u8; 32], u64);
+
 pub struct MeshDatabase {
     /// Tracks pubkeys marked offline (for test assertions).
     offline_peers: Arc<Mutex<Vec<[u8; 32]>>>,
     /// Pending messages: (message_id, unix_sec_timestamp).
-    pending_messages: Arc<Mutex<Vec<([u8; 32], u64)>>>,
+    pending_messages: Arc<Mutex<Vec<PendingMessageRecord>>>,
 }
 
 impl MeshDatabase {
