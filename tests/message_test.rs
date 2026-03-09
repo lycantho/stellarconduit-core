@@ -134,7 +134,9 @@ fn test_topology_update_roundtrip() {
 
 #[test]
 fn test_sync_request_roundtrip() {
-    let req = SyncRequest {};
+    let req = SyncRequest {
+        known_message_ids: vec![[1u8; 4], [2u8; 4]],
+    };
     let msg = ProtocolMessage::SyncRequest(req);
 
     let bytes = msg.to_bytes().expect("Failed to serialize");

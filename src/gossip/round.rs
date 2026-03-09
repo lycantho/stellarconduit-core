@@ -12,6 +12,7 @@ pub struct GossipScheduler {
 }
 
 impl GossipScheduler {
+    /// Creates a new GossipScheduler initialized to the current time.
     pub fn new() -> Self {
         let now = Instant::now();
         Self {
